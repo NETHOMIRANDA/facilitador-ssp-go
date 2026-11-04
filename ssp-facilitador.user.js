@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Facilitador de Atendimento SSP-GO (Móvel / Policial Militar)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Agiliza o preenchimento de atendimentos e registro de RAI no celular para Policiais Militares (SSP-GO).
 // @author       PMGO / SSP-GO Helper
 // @match        *://atendimento.ssp.go.gov.br/*
@@ -117,6 +117,20 @@
     const CHAVE_NAT_CACHE = 'ssp_naturezas_cache_v1';
     const SUGESTOES_FIXAS = ['PATRULHAMENTO', 'PONTO DE ESTACIONAMENTO'];
     let listaNaturezasCompleta = [];
+    let coletandoEmAndamento = false;
+
+    // Impede corrida simultanea: so UM varredura/carregamento por vez
+    async function garantirListaCarregada() {
+        if (listaNaturezasCompleta.length) return true;
+        if (coletandoEmAndamento) return false;
+        coletandoEmAndamento = true;
+        try {
+            listaNaturezasCompleta = await coletarTodasNaturezas();
+        } finally {
+            coletandoEmAndamento = false;
+        }
+        return listaNaturezasCompleta.length > 0;
+    }
 
     // Tira acentos e padroniza (ex: "TRAfego" == "TRAFEGO") pra busca instantanea
     function normalizar(t) {
@@ -595,24 +609,41 @@
 
         // Busca rápida de natureza - FILTRO LOCAL INSTANTÂNEO
         const inputNat = document.getElementById('ssp-input-natureza');
-        inputNat.addEventListener('input', (e) => {
-            pintarNaturezas(e.target.value);
+        inputNat.addEventListener('input', async (e) => {
+            const texto = e.target.value;
+
+            // Lista local pronta? Filtra na hora (instantâneo).
+            if (listaNaturezasCompleta.length) {
+                pintarNaturezas(texto);
+                return;
+            }
+
+            // Sem lista local: tenta carregar (cache → varredura A-Z). Só UMA por vez.
+            const ok = await garantirListaCarregada();
+            if (ok) {
+                pintarNaturezas(texto);
+                return;
+            }
+
+            // Plano B: digita no campo do sistema e ESPELHA as opções que surgirem
+            // (comportamento original da v1.0 que funcionava no celular)
+            await filtrarNaturezaNoSistema(texto);
+            espelharOpcoesDoSistema();
         });
 
         // Toque/clique no campo: carrega a LISTA COMPLETA em segundo plano (cache primeiro).
-        //Lista fica OCULTA - aparece apenas quando comecar a digitar.
+        // Lista fica OCULTA - aparece apenas quando comecar a digitar.
         inputNat.addEventListener('focus', async () => {
             if (!listaNaturezasCompleta.length) {
                 mostrarToast('🔄 Carregando lista completa de naturezas...');
-                listaNaturezasCompleta = await coletarTodasNaturezas();
-                if (listaNaturezasCompleta.length) {
-                    localStorage.setItem(CHAVE_NAT_CACHE, JSON.stringify(listaNaturezasCompleta));
-                    mostrarToast(`✅ Lista pronta! Comece a digitar para filtrar.`);
+                const ok = await garantirListaCarregada();
+                if (ok) {
+                    mostrarToast('✅ Lista pronta! Comece a digitar para filtrar.');
                 } else {
                     mostrarToast('⚠️ Abra o campo de natureza no sistema 1x pra copiar a lista.');
                 }
             }
-            if (inputNat.value.trim()) {
+            if (inputNat.value.trim() && listaNaturezasCompleta.length) {
                 pintarNaturezas(inputNat.value);
             }
         });
@@ -690,8 +721,68 @@
         // Espera renderização das opções no dropdown
         await esperar(400);
 
-        // Monitora as opções abertas pelo UI-Select para mostrar na nossa gaveta
-        atualizarListaOpcoesNatureza();
+        // Espelha as opções abertas pelo ui-select na gaveta (plano B da v1.0)
+        espelharOpcoesDoSistema();
+    }
+
+    /**
+     * PLANO B (restaurado da v1.0): enquanto a lista completa não estiver no cache,
+     * digita-te no campo do sistema e as opções que o ui-select revelar são ESPELHADAS
+     * na gaveta (#ssp-resultado-naturezas). Tocar numa opção espeilhada seleciona a
+     * natureza no sistema normalmente — e o texto entra no cache local.
+     */
+    function espelharOpcoesDoSistema() {
+        const cont = document.getElementById('ssp-resultado-naturezas');
+        if (!cont) return;
+
+        const inputNat = document.getElementById('ssp-input-natureza');
+        const filtro = inputNat ? normalizar(inputNat.value) : '';
+
+        const rows = document.querySelectorAll(
+            '#selectNaturezasOcorrencia .ui-select-choices-row, .ui-select-choices-group li'
+        );
+        if (!rows || !rows.length) return;
+
+        const achadas = [];
+        rows.forEach(r => {
+            const t = (r.textContent || '').trim();
+            // coincide exatamente, sem acento, ou contém (se houver filtro digitado)
+            const norm = normalizar(t);
+            const batiz = !filtro || norm === filtro || norm.includes(filtro);
+            if (t && !/^DIGITE PARA PESQUISAR/i.test(t) && batiz) achadas.push(t);
+        });
+
+        if (!achadas.length) return;
+
+        cont.innerHTML = '';
+        cont.style.display = 'block';
+
+        // deixa os chips fixos no topo se baterem com o filtro
+        const fixoBatendo = SUGESTOES_FIXAS.filter(f => !filtro || normalizar(f).includes(filtro));
+        const unicas = [...fixoBatendo, ...achadas].filter((v, i, a) => a.indexOf(v) === i).slice(0, 80);
+
+        unicas.forEach(txt => {
+            const div = document.createElement('div');
+            div.className = 'ssp-natureza-item';
+            div.textContent = (SUGESTOES_FIXAS.includes(txt) ? '⭐ ' : '') + txt;
+            div.onclick = () => {
+                if (inputNat) inputNat.value = txt;
+                selecionarNaturezaNoSistema(txt);
+            };
+            cont.appendChild(div);
+        });
+
+        // alimenta o cache local com o que o sistema revelou
+        try {
+            const salvas = JSON.parse(localStorage.getItem(CHAVE_NAT_CACHE) || '[]');
+            const nova = [...salvas, ...achadas].filter((v, i, a) => a.indexOf(v) === i);
+            if (nova.length > salvas.length) {
+                localStorage.setItem(CHAVE_NAT_CACHE, JSON.stringify(nova));
+                listaNaturezasCompleta = nova;
+            }
+        } catch (e) { /* cache invalido: ignora */ }
+
+        console.log('[SSP Facilitador] Espeilhadas do sistema:', achadas.length);
     }
 
     /**
