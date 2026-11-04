@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Facilitador de Atendimento SSP-GO (Móvel / Policial Militar)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Agiliza o preenchimento de atendimentos e registro de RAI no celular para Policiais Militares (SSP-GO).
 // @author       PMGO / SSP-GO Helper
 // @match        *://atendimento.ssp.go.gov.br/*
@@ -291,9 +291,17 @@
 
         // 3. fallback - digita no campo do sistema e pega a primeira opcao
         if (!alvo) {
-            await filtrarNaturezaNoSistema(texto);
-            await esperar(500);
-            alvo = document.querySelector('#selectNaturezasOcorrencia .ui-select-choices-row, .ui-select-choices-group li');
+            await planoB(texto);
+            await esperar(300);
+            alvo = document.querySelector(
+                '#selectNaturezasOcorrencia .ui-select-choices-row, ' +
+                '#selectNaturezasOcorrencia .ui-select-choices-row-inner, ' +
+                '#selectNaturezasOcorrencia .ui-select-choices li'
+            );
+            if (!alvo) {
+                alvo = [...document.querySelectorAll('.ui-select-choices-row, .ui-select-choices-row-inner, .ui-select-choices li')]
+                    .filter(r => r.offsetParent !== null)[0] || null;
+            }
         }
 
         if (alvo) {
@@ -627,8 +635,14 @@
 
             // Plano B: digita no campo do sistema e ESPELHA as opções que surgirem
             // (comportamento original da v1.0 que funcionava no celular)
-            await filtrarNaturezaNoSistema(texto);
-            espelharOpcoesDoSistema();
+            const n = await planoB(texto);
+            if (!n) {
+                const cont = document.getElementById('ssp-resultado-naturezas');
+                if (cont) {
+                    cont.style.display = 'block';
+                    cont.innerHTML = '<div style="padding:10px; color:#fca5a5; font-size:12px;">⚠️ O sistema não revelou opções ainda. Abra o modal "Adicionar Natureza" lá no sistema (toque no campo de natureza da página), depois volte e digite aqui de novo.</div>';
+                }
+            }
         });
 
         // Toque/clique no campo: carrega a LISTA COMPLETA em segundo plano (cache primeiro).
@@ -733,26 +747,36 @@
      */
     function espelharOpcoesDoSistema() {
         const cont = document.getElementById('ssp-resultado-naturezas');
-        if (!cont) return;
+        if (!cont) return 0;
 
         const inputNat = document.getElementById('ssp-input-natureza');
         const filtro = inputNat ? normalizar(inputNat.value) : '';
 
-        const rows = document.querySelectorAll(
-            '#selectNaturezasOcorrencia .ui-select-choices-row, .ui-select-choices-group li'
+        // Varredura larga: cada variacao do ui-select renderiza as opcoes com classe diferente
+        let rows = document.querySelectorAll(
+            '#selectNaturezasOcorrencia .ui-select-choices-row, ' +
+            '#selectNaturezasOcorrencia .ui-select-choices-row-inner, ' +
+            '#selectNaturezasOcorrencia .ui-select-choices li, ' +
+            '#selectNaturezasOcorrencia .ui-select-choices-group li'
         );
-        if (!rows || !rows.length) return;
+
+        // Fallback: container sem o id esperado? Pega as linhas VISIVEIS de qq dropdown ui-select
+        if (!rows || !rows.length) {
+            rows = [...document.querySelectorAll('.ui-select-choices-row, .ui-select-choices-row-inner, .ui-select-choices li')]
+                .filter(r => r.offsetParent !== null); // só as que estão renderizadas na tela
+        }
+        if (!rows || !rows.length) return 0;
 
         const achadas = [];
         rows.forEach(r => {
-            const t = (r.textContent || '').trim();
+            const t = (r.textContent || '').replace(/\s+/g, ' ').trim();
             // coincide exatamente, sem acento, ou contém (se houver filtro digitado)
             const norm = normalizar(t);
             const batiz = !filtro || norm === filtro || norm.includes(filtro);
-            if (t && !/^DIGITE PARA PESQUISAR/i.test(t) && batiz) achadas.push(t);
+            if (t && t.length >= 2 && !/^DIGITE PARA PESQUISAR/i.test(t) && batiz) achadas.push(t);
         });
 
-        if (!achadas.length) return;
+        if (!achadas.length) return 0;
 
         cont.innerHTML = '';
         cont.style.display = 'block';
@@ -782,7 +806,50 @@
             }
         } catch (e) { /* cache invalido: ignora */ }
 
-        console.log('[SSP Facilitador] Espeilhadas do sistema:', achadas.length);
+        console.log('[SSP Facilitador] Espelhadas do sistema:', achadas.length);
+        return achadas.length;
+    }
+
+    /**
+     * PLANO B completo: garante o dropdown do sistema aberto (o input de busca
+     * às vezes só nasce depois de abrir), digita o filtro lá, e espelha as opções
+     * na gaveta com RE-TENTATIVA (a filtragem do sistema é lenta no celular).
+     */
+    async function planoB(texto) {
+        if (!texto) return 0;
+
+        // 1. abre o campo do sistema se o input de busca ainda não existir
+        let inputSistema = buscarElemento(
+            "#selectNaturezasOcorrencia input.ui-select-search",
+            ["#selectNaturezasOcorrencia input"]
+        );
+        if (!inputSistema) {
+            const match = document.querySelector('#selectNaturezasOcorrencia .ui-select-match');
+            if (match) {
+                clicarElemento(match);
+                await esperar(700);
+            }
+            inputSistema = buscarElemento(
+                "#selectNaturezasOcorrencia input.ui-select-search",
+                ["#selectNaturezasOcorrencia input"]
+            );
+            if (!inputSistema) {
+                console.warn('[SSP Facilitador] planoB: campo de natureza não encontrado — abra o modal Adicionar Natureza no sistema.');
+                return 0;
+            }
+        }
+
+        // 2. digita o filtro no campo do sistema
+        preencherInput(inputSistema, texto);
+
+        // 3. espelha com re-tentativa (as opções podem demorar a renderizar)
+        let n = 0;
+        for (const pausa of [400, 600, 1200]) {
+            await esperar(pausa);
+            n = espelharOpcoesDoSistema();
+            if (n > 0) break;
+        }
+        return n;
     }
 
     /**
